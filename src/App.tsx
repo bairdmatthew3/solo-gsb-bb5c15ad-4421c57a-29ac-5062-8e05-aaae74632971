@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Waveform, type Region, type SeamMarker } from './components/Waveform';
 import { SeamSpectrumPanel } from './components/SeamSpectrumPanel';
 import { MonoCompatPanel, type MonoCompatPlayTarget } from './components/MonoCompatPanel';
+import { OnsetSlicePanel } from './components/OnsetSlicePanel';
 import { LoopPlayer } from './audio/player';
 import { decodeAudioFile } from './audio/decode';
 import { findCandidateSeams, type SeamResult } from './audio/loopFinder';
@@ -11,6 +12,8 @@ import { analyzeSeamSpectrum } from './audio/seamSpectrum';
 import { encodeWav, wavFileSize } from './audio/wavExport';
 import type { MonoCompatInterval, MonoCompatResult } from './audio/monoCompatibility';
 import type { MonoCompatWorkerResponse } from './workers/monoCompatWorker';
+import type { OnsetDetectResult } from './audio/onsetDetect';
+import type { OnsetWorkerResponse } from './workers/onsetWorker';
 import type { RepeatDetectResult, RepeatMatch } from './audio/repeatDetect';
 import type { RepeatWorkerResponse } from './workers/repeatWorker';
 import { fmtBytes, fmtTime } from './utils/format';
@@ -41,7 +44,7 @@ const roundTo = (x: number, decimals: number): number => {
   return Math.round(x * p) / p;
 };
 
-type PlayTarget = 'original' | 'optimized' | 'compat-stereo' | 'compat-mono';
+type PlayTarget = 'original' | 'optimized' | 'compat-stereo' | 'compat-mono' | 'onset-slice';
 
 export default function App() {
   const [fileName, setFileName] = useState('');
@@ -69,12 +72,19 @@ export default function App() {
   const [compatResult, setCompatResult] = useState<MonoCompatResult | null>(null);
   const [compatBusy, setCompatBusy] = useState(false);
   const [appliedCompatIdx, setAppliedCompatIdx] = useState<number | null>(null);
+  // 起音切片：后台 Worker 结果、分析中标记、已试听切片与正在单次试听的切片序号
+  const [onsetResult, setOnsetResult] = useState<OnsetDetectResult | null>(null);
+  const [onsetBusy, setOnsetBusy] = useState(false);
+  const [onsetSelectedIdx, setOnsetSelectedIdx] = useState<number | null>(null);
+  const [onsetPlayingIdx, setOnsetPlayingIdx] = useState<number | null>(null);
   const playerRef = useRef<LoopPlayer | null>(null);
   const repeatWorkerRef = useRef<Worker | null>(null);
   // 分析请求令牌：换文件 / 重新分析时使过期的 Worker 回包失效
   const repeatTokenRef = useRef(0);
   const compatWorkerRef = useRef<Worker | null>(null);
   const compatTokenRef = useRef(0);
+  const onsetWorkerRef = useRef<Worker | null>(null);
+  const onsetTokenRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 当前选中的候选接缝：「试听选中候选」与 JSON / WAV 导出的目标
@@ -108,8 +118,36 @@ export default function App() {
       repeatWorkerRef.current = null;
       compatWorkerRef.current?.terminate();
       compatWorkerRef.current = null;
+      onsetWorkerRef.current?.terminate();
+      onsetWorkerRef.current = null;
     };
   }, []);
+
+  // 当前播放目标的实时值（选区变化的清理副作用中读取，避免闭包过期）
+  const playingRef = useRef<PlayTarget | null>(null);
+  useEffect(() => {
+    playingRef.current = playing;
+  }, [playing]);
+
+  // 改变选区（拖拽边界、点击重复片段 / 风险区间载入选区、周期吸附等）后，
+  // 旧起音切片结果失效：终止进行中的分析、使过期 Worker 回包失效并清空结果；
+  // 正在试听的切片也一并停止（切片基于旧范围）
+  const selectionRef = useRef<Region | null>(null);
+  useEffect(() => {
+    if (selectionRef.current === selection) return;
+    selectionRef.current = selection;
+    onsetTokenRef.current++;
+    onsetWorkerRef.current?.terminate();
+    onsetWorkerRef.current = null;
+    setOnsetResult(null);
+    setOnsetBusy(false);
+    setOnsetSelectedIdx(null);
+    setOnsetPlayingIdx(null);
+    if (playingRef.current === 'onset-slice') {
+      playerRef.current?.stop();
+      setPlaying(null);
+    }
+  }, [selection]);
 
   /**
    * 立体声/单声道兼容性检查：在后台 Worker 逐窗计算左右声道相关度与等权单声道能量损失。
@@ -223,6 +261,14 @@ export default function App() {
       setCompatResult(null);
       setCompatBusy(false);
       setAppliedCompatIdx(null);
+      // 换文件时清除旧的起音切片结果：终止进行中的分析并使过期回包失效
+      onsetTokenRef.current++;
+      onsetWorkerRef.current?.terminate();
+      onsetWorkerRef.current = null;
+      setOnsetResult(null);
+      setOnsetBusy(false);
+      setOnsetSelectedIdx(null);
+      setOnsetPlayingIdx(null);
       const loaded = `已加载：${file.name} — ${buf.sampleRate} Hz / ${buf.numberOfChannels} 声道 / 时长 ${fmtTime(buf.duration)}。`;
       if (buf.numberOfChannels === 2) {
         // 双声道：自动在后台执行兼容性检查
@@ -568,6 +614,7 @@ export default function App() {
     }
     const sr = buffer.sampleRate;
     const pcm = buildLoopPcm(buffer, selection.start * sr, selection.end * sr, 0);
+    setOnsetPlayingIdx(null);
     await getPlayer().play(pcm);
     setPlaying('original');
   }, [buffer, selection]);
@@ -579,6 +626,7 @@ export default function App() {
       const s = list[idx];
       if (!s) return;
       const pcm = buildLoopPcm(buffer, s.startSample, s.endSample, (crossfadeMs / 1000) * buffer.sampleRate);
+      setOnsetPlayingIdx(null);
       await getPlayer().play(pcm);
       setPlaying('optimized');
     },
@@ -613,6 +661,7 @@ export default function App() {
   const stopPlayback = useCallback(() => {
     getPlayer().stop();
     setPlaying(null);
+    setOnsetPlayingIdx(null);
   }, []);
 
   /** 兼容性检查面板：再点当前模式按钮则停止，否则在已载入区间上切换原立体声 / 等权单声道 */
@@ -629,9 +678,130 @@ export default function App() {
         setPlaying(null);
         return;
       }
+      // 从起音切片试听切到其他试听模式时，清掉切片试听高亮
+      setOnsetPlayingIdx(null);
       await playCompatInterval(iv, mode);
     },
     [compatResult, appliedCompatIdx, playing, playCompatInterval],
+  );
+
+  /**
+   * 起音切片分析：在后台 Worker 对当前波形选区（未选时为整段）做多频带
+   * 正向能量变化起音检测；换文件 / 改选区时通过令牌使过期回包失效。
+   */
+  const analyzeOnsets = useCallback(() => {
+    if (!buffer || onsetBusy) return;
+    const sr = buffer.sampleRate;
+    const rangeStart = selection ? Math.max(0, Math.round(selection.start * sr)) : 0;
+    const rangeEnd = selection ? Math.min(buffer.length, Math.round(selection.end * sr)) : buffer.length;
+    if (rangeEnd - rangeStart < 2) {
+      setStatus('当前范围为空，无法分析起音。');
+      return;
+    }
+    if (!onsetWorkerRef.current) {
+      onsetWorkerRef.current = new Worker(new URL('./workers/onsetWorker.ts', import.meta.url), {
+        type: 'module',
+      });
+    }
+    const worker = onsetWorkerRef.current;
+    const token = ++onsetTokenRef.current;
+    // 复制声道数据并转移所有权（不能转移 AudioBuffer 内部数组，否则波形 / 试听失效）
+    const channels: Float32Array[] = [];
+    for (let c = 0; c < buffer.numberOfChannels; c++) {
+      channels.push(buffer.getChannelData(c).slice());
+    }
+    setOnsetBusy(true);
+    setOnsetResult(null);
+    setOnsetSelectedIdx(null);
+    setOnsetPlayingIdx(null);
+    setStatus(
+      `起音切片：后台线程对${selection ? '当前选区' : '整段音频'}分析多频带正向能量变化与自适应阈值，页面可继续操作…`,
+    );
+    worker.onmessage = (e: MessageEvent<OnsetWorkerResponse>) => {
+      if (token !== onsetTokenRef.current) return; // 已换文件 / 改选区 / 重新分析，丢弃过期结果
+      setOnsetBusy(false);
+      const msg = e.data;
+      if (msg.type === 'error') {
+        setStatus(`起音切片分析失败：${msg.message}。可重新分析。`);
+        return;
+      }
+      const res = msg.result;
+      setOnsetResult(res);
+      if (res.failure === 'too-short') {
+        setStatus(
+          `起音切片：分析范围过短（时长 ${fmtTime((res.rangeEndSample - res.rangeStartSample) / sr)}），` +
+            '不足 4 个分析帧，请扩大选区后重试。',
+        );
+      } else if (res.failure === 'silence') {
+        setStatus('起音切片：分析范围接近静音（各帧 RMS 均低于 −60 dBFS），未检测到起音。');
+      } else if (res.failure === 'no-onset') {
+        setStatus(
+          `起音切片：${res.frameCount} 帧中有 ${res.silentFrames} 个静音帧，其余帧能量正向变化均未超过` +
+            '局部噪声底自适应阈值，未检测到有效起音。',
+        );
+      } else {
+        setStatus(
+          `起音切片：保留 ${res.onsets.length} 个起音（局部峰候选 ${res.peakCandidates} 个），` +
+            `切出 ${res.slices.length} 片（首尾边界为范围起止点，无空片）。点击切片行可单次试听原声道片段，并可单独下载无循环标记 WAV。`,
+        );
+      }
+    };
+    worker.onerror = () => {
+      if (token !== onsetTokenRef.current) return;
+      setOnsetBusy(false);
+      setStatus('起音切片分析失败：后台线程异常终止。可重新分析。');
+    };
+    worker.postMessage({ sampleRate: sr, channels, rangeStartSample: rangeStart, rangeEndSample: rangeEnd },
+      channels.map((c) => c.buffer));
+  }, [buffer, selection, onsetBusy]);
+
+  /** 单次试听起音切片：原声道、原采样率、不循环，自然播完一次即结束；再点同一切片则停止 */
+  const playOnsetSlice = useCallback(
+    async (idx: number) => {
+      if (!buffer || !onsetResult) return;
+      const sl = onsetResult.slices[idx];
+      if (!sl) return;
+      if (playing === 'onset-slice' && onsetPlayingIdx === idx) {
+        getPlayer().stop();
+        setPlaying(null);
+        setOnsetPlayingIdx(null);
+        return;
+      }
+      // 原声道片段：交叉淡化为 0，起止点直接取自切片
+      const pcm = buildLoopPcm(buffer, sl.startSample, sl.endSample, 0);
+      setOnsetSelectedIdx(idx);
+      setOnsetPlayingIdx(idx);
+      setPlaying('onset-slice');
+      await getPlayer().playOnce(pcm, () => {
+        // 自然播完一次：清除播放状态（保留已试听高亮）
+        setOnsetPlayingIdx((cur) => (cur === idx ? null : cur));
+        setPlaying((cur) => (cur === 'onset-slice' ? null : cur));
+      });
+    },
+    [buffer, onsetResult, playing, onsetPlayingIdx],
+  );
+
+  /** 单独下载起音切片：16-bit PCM WAV，不带 smpl 循环标记 */
+  const downloadOnsetSlice = useCallback(
+    (idx: number) => {
+      if (!buffer || !onsetResult) return;
+      const sl = onsetResult.slices[idx];
+      if (!sl) return;
+      const pcm = buildLoopPcm(buffer, sl.startSample, sl.endSample, 0);
+      const wav = encodeWav(pcm, { includeLoopChunk: false });
+      const blob = new Blob([wav], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${fileName.replace(/\.[^.]+$/, '') || 'audio'}.onset-${String(idx + 1).padStart(3, '0')}.wav`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setStatus(
+        `已下载切片 #${idx + 1}：${fmtTime(sl.startSample / buffer.sampleRate)} ~ ${fmtTime(sl.endSample / buffer.sampleRate)}` +
+          `（时长 ${fmtTime((sl.endSample - sl.startSample) / buffer.sampleRate)}），16-bit PCM WAV，不含循环标记，共 ${fmtBytes(wav.byteLength)}。`,
+      );
+    },
+    [buffer, onsetResult, fileName],
   );
 
   // 交叉淡化时长变化时，若正在试听优化区间则实时重建并继续播放
@@ -962,6 +1132,18 @@ export default function App() {
               </table>
             )}
           </section>
+
+          <OnsetSlicePanel
+            busy={onsetBusy}
+            result={onsetResult}
+            targetLabel={selection ? '当前波形选区' : '整段音频'}
+            selectedIdx={onsetSelectedIdx}
+            playingIdx={onsetPlayingIdx}
+            onAnalyze={analyzeOnsets}
+            onPlaySlice={(idx) => void playOnsetSlice(idx)}
+            onStop={stopPlayback}
+            onDownloadSlice={downloadOnsetSlice}
+          />
 
           <section className="panel period">
             <h2>周期校准</h2>
