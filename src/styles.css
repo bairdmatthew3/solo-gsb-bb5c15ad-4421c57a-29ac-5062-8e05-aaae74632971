@@ -430,6 +430,86 @@ td.compat-bad {
   color: #9aa7bd;
 }
 
+/* 起音切片面板 */
+.onsets h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.onsets-desc {
+  margin: 0 0 12px;
+  font-size: 12px;
+  color: #9aa7bd;
+}
+
+.onsets .transport {
+  margin-bottom: 12px;
+}
+
+.onsets table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  margin-top: 12px;
+}
+
+.onsets th,
+.onsets td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid #232c40;
+}
+
+.onsets th {
+  color: #9aa7bd;
+  font-weight: 500;
+  font-size: 12px;
+}
+
+.onsets tbody tr {
+  cursor: pointer;
+  transition: background 0.12s;
+}
+
+.onsets tbody tr:hover {
+  background: rgba(91, 141, 239, 0.08);
+}
+
+.onsets tbody tr.playing {
+  background: rgba(47, 210, 125, 0.1);
+}
+
+.onsets tbody tr.playing td {
+  color: #7fe6b0;
+}
+
+.onsets tr.playing .rank {
+  background: #2fd27d;
+  color: #06251a;
+}
+
+.onsets-summary {
+  margin: 12px 0 0;
+  font-size: 13px;
+  color: #9aa7bd;
+}
+
+.onsets-summary b {
+  color: #7fe6b0;
+}
+
+.onsets-note {
+  margin: 10px 0 0;
+  font-size: 12px;
+  color: #9aa7bd;
+}
+
+.slice-dl {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
 /* 接缝频谱检查面板 */
 .spectrum h2 {
   margin: 0 0 8px;

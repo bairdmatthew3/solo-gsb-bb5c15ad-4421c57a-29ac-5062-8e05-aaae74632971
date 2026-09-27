@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Waveform, type Region, type SeamMarker } from './components/Waveform';
 import { SeamSpectrumPanel } from './components/SeamSpectrumPanel';
 import { MonoCompatPanel, type MonoCompatPlayTarget } from './components/MonoCompatPanel';
+import { OnsetSlicePanel } from './components/OnsetSlicePanel';
 import { LoopPlayer } from './audio/player';
 import { decodeAudioFile } from './audio/decode';
 import { findCandidateSeams, type SeamResult } from './audio/loopFinder';
@@ -13,6 +14,8 @@ import type { MonoCompatInterval, MonoCompatResult } from './audio/monoCompatibi
 import type { MonoCompatWorkerResponse } from './workers/monoCompatWorker';
 import type { RepeatDetectResult, RepeatMatch } from './audio/repeatDetect';
 import type { RepeatWorkerResponse } from './workers/repeatWorker';
+import type { OnsetSliceResult } from './audio/onsetSlice';
+import type { OnsetWorkerResponse } from './workers/onsetWorker';
 import { fmtBytes, fmtTime } from './utils/format';
 
 const SLOPE_WINDOW = 32;
@@ -33,6 +36,10 @@ const MONO_COMPAT_WINDOW_MS = 100;
 const MONO_COMPAT_HOP_MS = 50;
 const MONO_COMPAT_QUIET_DBFS = -50;
 const MONO_COMPAT_RISK_LOSS_DB = -6;
+/** 起音切片：静音门限（dBFS）、自适应阈值系数、最小起音间隔（ms） */
+const ONSET_GATE_DBFS = -60;
+const ONSET_THRESHOLD_K = 3.5;
+const ONSET_MIN_INTERVAL_MS = 50;
 
 /** 保留 decimals 位小数的有限数值（防御 NaN / Infinity 进入 JSON） */
 const roundTo = (x: number, decimals: number): number => {
@@ -41,7 +48,7 @@ const roundTo = (x: number, decimals: number): number => {
   return Math.round(x * p) / p;
 };
 
-type PlayTarget = 'original' | 'optimized' | 'compat-stereo' | 'compat-mono';
+type PlayTarget = 'original' | 'optimized' | 'compat-stereo' | 'compat-mono' | 'slice';
 
 export default function App() {
   const [fileName, setFileName] = useState('');
@@ -69,12 +76,18 @@ export default function App() {
   const [compatResult, setCompatResult] = useState<MonoCompatResult | null>(null);
   const [compatBusy, setCompatBusy] = useState(false);
   const [appliedCompatIdx, setAppliedCompatIdx] = useState<number | null>(null);
+  // 起音切片：后台 Worker 分析结果、分析中标记、正在单次试听的切片序号
+  const [onsetResult, setOnsetResult] = useState<OnsetSliceResult | null>(null);
+  const [onsetBusy, setOnsetBusy] = useState(false);
+  const [playingSliceIdx, setPlayingSliceIdx] = useState<number | null>(null);
   const playerRef = useRef<LoopPlayer | null>(null);
   const repeatWorkerRef = useRef<Worker | null>(null);
   // 分析请求令牌：换文件 / 重新分析时使过期的 Worker 回包失效
   const repeatTokenRef = useRef(0);
   const compatWorkerRef = useRef<Worker | null>(null);
   const compatTokenRef = useRef(0);
+  const onsetWorkerRef = useRef<Worker | null>(null);
+  const onsetTokenRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 当前选中的候选接缝：「试听选中候选」与 JSON / WAV 导出的目标
@@ -100,6 +113,16 @@ export default function App() {
     return playerRef.current;
   };
 
+  /** 清除起音切片的旧结果：使过期 Worker 回包失效并终止进行中的后台分析 */
+  const resetOnsetAnalysis = useCallback(() => {
+    onsetTokenRef.current++;
+    onsetWorkerRef.current?.terminate();
+    onsetWorkerRef.current = null;
+    setOnsetResult(null);
+    setOnsetBusy(false);
+    setPlayingSliceIdx(null);
+  }, []);
+
   // 卸载时停止播放并终止后台分析线程
   useEffect(() => {
     return () => {
@@ -108,8 +131,27 @@ export default function App() {
       repeatWorkerRef.current = null;
       compatWorkerRef.current?.terminate();
       compatWorkerRef.current = null;
+      onsetWorkerRef.current?.terminate();
+      onsetWorkerRef.current = null;
     };
   }, []);
+
+  // 选区变化（拖动把手、周期吸附、载入重复片段 / 风险区间等任何来源）后，
+  // 起音切片的旧结果与进行中的后台分析随之失效；正在试听的切片一并停止
+  const selectionRef = useRef(selection);
+  const playingRef = useRef<PlayTarget | null>(null);
+  useEffect(() => {
+    playingRef.current = playing;
+  }, [playing]);
+  useEffect(() => {
+    if (selectionRef.current === selection) return;
+    selectionRef.current = selection;
+    resetOnsetAnalysis();
+    if (playingRef.current === 'slice') {
+      playerRef.current?.stop();
+      setPlaying(null);
+    }
+  }, [selection, resetOnsetAnalysis]);
 
   /**
    * 立体声/单声道兼容性检查：在后台 Worker 逐窗计算左右声道相关度与等权单声道能量损失。
@@ -223,6 +265,8 @@ export default function App() {
       setCompatResult(null);
       setCompatBusy(false);
       setAppliedCompatIdx(null);
+      // 换文件时清除旧的起音切片结果：终止进行中的分析并使过期回包失效
+      resetOnsetAnalysis();
       const loaded = `已加载：${file.name} — ${buf.sampleRate} Hz / ${buf.numberOfChannels} 声道 / 时长 ${fmtTime(buf.duration)}。`;
       if (buf.numberOfChannels === 2) {
         // 双声道：自动在后台执行兼容性检查
@@ -238,7 +282,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [runMonoCompat]);
+  }, [runMonoCompat, resetOnsetAnalysis]);
 
   const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -497,6 +541,134 @@ export default function App() {
     [buffer, compatResult, playing, playCompatInterval],
   );
 
+  /** 起音切片：在后台 Worker 中对当前选区（未框选时为整段）检测瞬态起音并切片，不阻塞页面 */
+  const analyzeOnsets = useCallback(() => {
+    if (!buffer || onsetBusy) return;
+    if (!onsetWorkerRef.current) {
+      onsetWorkerRef.current = new Worker(
+        new URL('./workers/onsetWorker.ts', import.meta.url),
+        { type: 'module' },
+      );
+    }
+    const worker = onsetWorkerRef.current;
+    const token = ++onsetTokenRef.current;
+    const sr = buffer.sampleRate;
+    // 复制声道数据并转移所有权（不能转移 AudioBuffer 内部数组，否则波形 / 试听失效）
+    const channels: Float32Array[] = [];
+    for (let c = 0; c < buffer.numberOfChannels; c++) {
+      channels.push(buffer.getChannelData(c).slice());
+    }
+    const range = selection
+      ? { startSec: selection.start, endSec: selection.end }
+      : { startSec: 0, endSec: buffer.duration };
+    const rangeLabel = selection ? '当前选区' : '整段音频';
+    setOnsetBusy(true);
+    setStatus(`起音切片：后台线程正在分析${rangeLabel}的瞬态（多频带短时能量的正向变化），页面可继续操作…`);
+    worker.onmessage = (e: MessageEvent<OnsetWorkerResponse>) => {
+      if (token !== onsetTokenRef.current) return; // 已换文件 / 改选区或重新分析，丢弃过期结果
+      setOnsetBusy(false);
+      const msg = e.data;
+      if (msg.type === 'error') {
+        setStatus(`起音切片失败：${msg.message}。可点击「重新分析并切片」重试。`);
+        return;
+      }
+      const res = msg.result;
+      setOnsetResult(res);
+      setPlayingSliceIdx(null);
+      if (res.failure === 'too-short') {
+        setStatus(`起音切片（${rangeLabel}）：范围太短，不足一个分析窗，无法检测起音。`);
+        return;
+      }
+      if (res.failure === 'silence') {
+        setStatus(
+          `起音切片（${rangeLabel}）：范围电平低于静音门限（${ONSET_GATE_DBFS} dBFS），无有效起音，未产生切片。`,
+        );
+        return;
+      }
+      if (res.failure === 'no-onset') {
+        setStatus(
+          `起音切片（${rangeLabel}）：未发现超过局部噪声底自适应阈值的有效起音` +
+            `（${res.totalFrames} 帧，静音门限排除 ${res.gatedFrames} 帧），未产生切片。`,
+        );
+        return;
+      }
+      const hopMs = ((res.hopSamples / sr) * 1000).toFixed(1);
+      setStatus(
+        `起音切片（${rangeLabel}）：${res.totalFrames} 帧（帧移 ${hopMs} ms，静音门限排除 ${res.gatedFrames} 帧），` +
+          `保留 ${res.onsets.length} 个起音，切出 ${res.slices.length} 片。` +
+          ` 点击列表单次试听原声道片段，可单独下载不带循环标记的 16-bit PCM WAV。`,
+      );
+    };
+    worker.onerror = () => {
+      if (token !== onsetTokenRef.current) return;
+      setOnsetBusy(false);
+      setStatus('起音切片失败：后台线程异常终止。可点击「重新分析并切片」重试。');
+    };
+    worker.postMessage(
+      {
+        sampleRate: sr,
+        channels,
+        range,
+        options: {
+          gateDbfs: ONSET_GATE_DBFS,
+          thresholdK: ONSET_THRESHOLD_K,
+          minIntervalSec: ONSET_MIN_INTERVAL_MS / 1000,
+        },
+      },
+      channels.map((c) => c.buffer),
+    );
+  }, [buffer, selection, onsetBusy]);
+
+  /** 点击切片：单次试听原声道片段（不循环，播完自动复位）；再次点击正在试听的切片则停止 */
+  const playSlice = useCallback(
+    async (idx: number) => {
+      if (!buffer || !onsetResult) return;
+      const slice = onsetResult.slices[idx];
+      if (!slice) return;
+      if (playing === 'slice' && playingSliceIdx === idx) {
+        getPlayer().stop();
+        setPlaying(null);
+        setPlayingSliceIdx(null);
+        return;
+      }
+      // 交叉淡化 0：buildLoopPcm 退化为原样截取，保留原声道
+      const pcm = buildLoopPcm(buffer, slice.startSample, slice.endSample, 0);
+      await getPlayer().play(pcm, {
+        loop: false,
+        onEnded: () => {
+          setPlaying((p) => (p === 'slice' ? null : p));
+          setPlayingSliceIdx(null);
+        },
+      });
+      setPlaying('slice');
+      setPlayingSliceIdx(idx);
+    },
+    [buffer, onsetResult, playing, playingSliceIdx],
+  );
+
+  /** 下载切片：16-bit PCM WAV，不写 smpl 循环区块 */
+  const downloadSlice = useCallback(
+    (idx: number) => {
+      if (!buffer || !onsetResult) return;
+      const slice = onsetResult.slices[idx];
+      if (!slice) return;
+      const pcm = buildLoopPcm(buffer, slice.startSample, slice.endSample, 0);
+      const wav = encodeWav(pcm, { loop: false });
+      const blob = new Blob([wav], { type: 'audio/wav' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${fileName.replace(/\.[^.]+$/, '') || 'slice'}.slice${String(idx + 1).padStart(2, '0')}.wav`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setStatus(
+        `已导出切片 #${idx + 1}（${fmtTime(slice.startSec)} – ${fmtTime(slice.endSec)}）：` +
+          `16-bit PCM，无循环标记，共 ${fmtBytes(wav.byteLength)}。`,
+      );
+    },
+    [buffer, onsetResult, fileName],
+  );
+
   /** 搜索半径变化：清空候选并禁用旧导出，需重新查找 */
   const onRadiusChange = (v: number) => {
     setRadiusMs(v);
@@ -613,6 +785,7 @@ export default function App() {
   const stopPlayback = useCallback(() => {
     getPlayer().stop();
     setPlaying(null);
+    setPlayingSliceIdx(null);
   }, []);
 
   /** 兼容性检查面板：再点当前模式按钮则停止，否则在已载入区间上切换原立体声 / 等权单声道 */
@@ -856,7 +1029,7 @@ export default function App() {
     <div className="app">
       <header className="header">
         <h1>无缝循环接缝查找器</h1>
-        <p>本地浏览器内分析音频：可自动发现整段音频中的重复片段并载入选区，先做周期校准吸附选区终点（定长接缝搜索），在粗选边界附近搜索幅值与短窗斜率最连续的接缝候选（Top 5 按代价排序），可点选对比试听、查看接缝频谱诊断热图并导出参数。</p>
+        <p>本地浏览器内分析音频：可按选区（缺省整段）在后台检测起音瞬态并切片试听 / 导出，自动发现整段音频中的重复片段并载入选区，先做周期校准吸附选区终点（定长接缝搜索），在粗选边界附近搜索幅值与短窗斜率最连续的接缝候选（Top 5 按代价排序），可点选对比试听、查看接缝频谱诊断热图并导出参数。</p>
       </header>
 
       <section
@@ -898,6 +1071,17 @@ export default function App() {
             onSelectInterval={(idx) => void applyCompatInterval(idx)}
             onPlayStereo={() => void playCompatMode('compat-stereo')}
             onPlayMono={() => void playCompatMode('compat-mono')}
+            onStop={stopPlayback}
+          />
+
+          <OnsetSlicePanel
+            hasSelection={selection !== null}
+            result={onsetResult}
+            busy={onsetBusy}
+            playingIdx={playing === 'slice' ? playingSliceIdx : null}
+            onAnalyze={analyzeOnsets}
+            onPlaySlice={(idx) => void playSlice(idx)}
+            onDownloadSlice={downloadSlice}
             onStop={stopPlayback}
           />
 
